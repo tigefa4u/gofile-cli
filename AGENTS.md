@@ -1,6 +1,7 @@
 # gofile-cli
 
 ## Commands
+- If `mise` is available, run `mise upgrade --bump` to update `uv` in `mise.toml`.
 - Install deps: `uv sync`
 - Run CLI: `uv run gofile-cli ...` (entrypoint `gofile_cli:main`)
 - Tests: `uv run python -m unittest discover -s tests -v`
