@@ -16,6 +16,9 @@
 - Token resolution: `--token` → `$GOFILE_API_TOKEN`/`$GOFILE_TOKEN` → `.env`.
 - `.env` is gitignored; template is `.env.example`.
 
+## Docs
+- Use the `chrome-devtools` MCP server to read live API docs at https://gofile.io/api (e.g. `list_pages` then `take_snapshot`).
+
 ## Gotchas
 - `contents get`/`search`/`copy`/`move`/`import`/direct links are Premium-only and return `error-notPremium` for standard accounts.
 - `usage lint` must pass after any CLI flag changes; keep `gofile.usage.kdl` in sync.
