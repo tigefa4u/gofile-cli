@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from rich.console import Console
+from rich.table import Table
 from typer_usage import generate
 
 from . import client
@@ -126,16 +128,35 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
         typer.echo("Error: no files to upload.", err=True)
         raise typer.Exit(code=1)
     current_folder = folder_id
-    for f in files:
-        try:
-            data = client.upload_file(
-                f, token=token, folder_id=current_folder, timeout=timeout
-            )
-        except client.GofileError as exc:
-            raise _fail(exc)
-        _print(data)
-        if current_folder is None and isinstance(data, dict):
-            current_folder = data.get("parentFolder")
+    console = Console()
+    results: list[tuple[Path, dict[str, Any]]] = []
+    with typer.progressbar(files, label="Uploading to Gofile") as progress:
+        for f in progress:
+            try:
+                data = client.upload_file(
+                    f, token=token, folder_id=current_folder, timeout=timeout
+                )
+            except client.GofileError as exc:
+                raise _fail(exc)
+            if not isinstance(data, dict):
+                data = {"result": data}
+            results.append((f, data))
+            if current_folder is None:
+                current_folder = data.get("parentFolder")
+
+    table = Table(title="Uploaded files")
+    table.add_column("File", style="cyan")
+    table.add_column("Size", justify="right")
+    table.add_column("Download page", style="green")
+    table.add_column("Parent folder", style="dim")
+    for f, data in results:
+        table.add_row(
+            f.name,
+            str(data.get("size", "")),
+            str(data.get("downloadPage", "")),
+            str(data.get("parentFolder", "")),
+        )
+    console.print(table)
 
 
 # ---------------- callback ----------------
