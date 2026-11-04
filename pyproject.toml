@@ -1,16 +1,29 @@
 [project]
 name = "gofile-cli"
 version = "1.0.0"
-description = "Add your description here"
+description = "A command-line client for the Gofile API: upload files and folders, and manage files, folders, accounts and direct links."
 readme = "README.md"
-authors = [
-    { name = "Sugeng Tigefa", email = "tigefa@gmail.com" }
+license = "MIT"
+authors = [{ name = "Sugeng Tigefa", email = "tigefa@gmail.com" }]
+keywords = ["gofile", "gofile.io", "upload", "cli", "file-sharing"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet",
+    "Topic :: Utilities",
 ]
 requires-python = ">=3.15"
 dependencies = [
     "typer>=0.27.3",
     "usage-spec-typer>=1.2.1",
 ]
+
+[project.urls]
+Homepage = "https://gitlab.com/tigefa/gofile-cli"
+Repository = "https://gitlab.com/tigefa/gofile-cli.git"
+Issues = "https://gitlab.com/tigefa/gofile-cli/-/issues"
 [project.scripts]
 gofile-cli = "gofile_cli:main"
 
