@@ -1,0 +1,81 @@
+# GitLab CI/CD for gofile-cli, using uv.
+# Based on https://docs.astral.sh/uv/guides/integration/gitlab/
+
+variables:
+  UV_VERSION: "0.13.7"
+  PYTHON_VERSION: "3.15"
+  BASE_LAYER: trixie-slim
+  UV_LINK_MODE: copy
+  UV_CACHE_DIR: .uv-cache
+
+default:
+  image: ghcr.io/astral-sh/uv:$UV_VERSION-python$PYTHON_VERSION-$BASE_LAYER
+  cache:
+    - key:
+        prefix: $CI_JOB_NAME
+        files:
+          - uv.lock
+      paths:
+        - $UV_CACHE_DIR
+  after_script:
+    - uv cache prune --ci
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - test
+  - build
+  - publish
+
+.install-project:
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends build-essential cmake
+
+lockfile:
+  stage: test
+  script:
+    - uv lock --locked
+
+smoke:
+  stage: test
+  extends: .install-project
+  script:
+    - uv sync --frozen
+    - uv run gofile-cli --help
+    - '! uv run gofile-cli missing.txt'
+    - uv run python -m unittest discover -s tests -v
+
+usage-spec:
+  stage: test
+  extends: .install-project
+  script:
+    - uv sync --frozen
+    - uv run gofile-cli --usage-spec > /tmp/gofile.usage.kdl.generated
+    - diff -u gofile.usage.kdl /tmp/gofile.usage.kdl.generated
+
+build:
+  stage: build
+  script:
+    - uv build --no-sources
+  artifacts:
+    paths:
+      - dist/*
+
+publish:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - VERSION=$(uv version --frozen | awk '{print $2}')
+    - test "${CI_COMMIT_TAG#v}" = "$VERSION" || { echo "tag $CI_COMMIT_TAG does not match version $VERSION in pyproject.toml"; exit 1; }
+    - uv build --no-sources
+    - uv publish
+  variables:
+    UV_PUBLISH_URL: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/pypi"
+    UV_PUBLISH_USERNAME: gitlab-ci-token
+    UV_PUBLISH_PASSWORD: "$CI_JOB_TOKEN"

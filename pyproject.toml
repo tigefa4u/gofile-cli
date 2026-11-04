@@ -1,0 +1,19 @@
+[project]
+name = "gofile-cli"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Sugeng Tigefa", email = "tigefa@gmail.com" }
+]
+requires-python = ">=3.15"
+dependencies = [
+    "typer>=0.27.3",
+    "usage-spec-typer>=1.2.1",
+]
+[project.scripts]
+gofile-cli = "gofile_cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
