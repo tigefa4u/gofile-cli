@@ -10,6 +10,7 @@ from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from typer_usage import generate
 
@@ -130,8 +131,18 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
     current_folder = folder_id
     console = Console()
     results: list[tuple[Path, dict[str, Any]]] = []
-    with typer.progressbar(files, label="Uploading to Gofile") as progress:
-        for f in progress:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}[/bold blue]"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Uploading to Gofile", total=len(files))
+        for f in files:
+            progress.update(task, description=f"Uploading {f.name}")
             try:
                 data = client.upload_file(
                     f, token=token, folder_id=current_folder, timeout=timeout
@@ -143,6 +154,7 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
             results.append((f, data))
             if current_folder is None:
                 current_folder = data.get("parentFolder")
+            progress.advance(task)
 
     table = Table(title="Uploaded files")
     table.add_column("File", style="cyan")
