@@ -20,6 +20,12 @@
 ## Docs
 - Use the `chrome-devtools` MCP server to read live API docs at https://gofile.io/api (e.g. `list_pages` then `take_snapshot`).
 
+## Remotes
+- `origin` → `git@gitlab.com:tigefa/gofile-cli.git` (primary; GitLab CI runs here).
+- `github` → `git@github.com:tigefa4u/gofile-cli.git` (public mirror, branch `main`).
+- Both repos are public. Never commit `.env` or a token — a force-add would be world-readable.
+- Pushing to one remote does not update the other: push to both, i.e. `git push origin main && git push github main`.
+
 ## Gotchas
 - `contents get`/`search`/`copy`/`move`/`import`/direct links are Premium-only and return `error-notPremium` for standard accounts.
 - `usage lint` must pass after any CLI flag changes; keep `gofile.usage.kdl` in sync.
