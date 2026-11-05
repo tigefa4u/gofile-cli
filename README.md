@@ -13,7 +13,7 @@ gofile-cli folder/ --recursive    # include subfolders
 gofile-cli upload file.txt --folder-id <uuid>
 ```
 
-Uploaded files print their JSON metadata (including `downloadPage`). Status and errors go to stderr.
+Uploaded files are summarized in a table (name, size, download page, parent folder). Status and errors go to stderr; commands exit 0 on success and 1 on failure (including refusals without `--yes`).
 
 ## Common commands
 
@@ -24,14 +24,17 @@ gofile-cli account getid                              # resolve token -> account
 gofile-cli contents delete <uuid> --yes                # delete content
 gofile-cli contents update <uuid> --name newname       # rename
 gofile-cli --usage-spec                               # print usage spec
+gofile-cli --version                                  # print version
 ```
 
 ## Authentication
 
 Token resolution order:
 1. `--token`
-2. `$GOFILE_API_TOKEN` / `$GOFILE_TOKEN`
-3. `.env` in current dir or `~/.config/gofile/.env`
+2. `$GOFILE_API_TOKEN` / `$GOFILE_TOKEN` environment variables
+3. First `.env` found in: current dir, `~/.config/gofile/.env`, `~/.gofile/.env` —
+   accepted keys: `GOFILE_API_TOKEN`, `GOFILE_TOKEN`, `GOFILER_API_TOKEN`
+   (`GOFILER_API_TOKEN` is only read from a `.env` file, never from the environment)
 
 ```ini
 # .env
@@ -51,5 +54,3 @@ uv run gofile-cli --usage-spec > gofile.usage.kdl
 ## License
 
 MIT
-EOF
-echo done

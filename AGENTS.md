@@ -14,7 +14,7 @@
 - Default upload shortcut: a first arg that is an existing file/folder and not a known subcommand is rewritten to `upload`.
 
 ## Auth
-- Token resolution: `--token` → `$GOFILE_API_TOKEN`/`$GOFILE_TOKEN` → `.env`.
+- Token resolution: `--token` → `$GOFILE_API_TOKEN`/`$GOFILE_TOKEN` → first `.env` in `./`, `~/.config/gofile/`, `~/.gofile/` (keys `GOFILE_API_TOKEN`, `GOFILE_TOKEN`, or `GOFILER_API_TOKEN`; that last key is only read from `.env` files, never from the environment).
 - `.env` is gitignored; template is `.env.example`.
 
 ## Docs
@@ -29,4 +29,5 @@
 ## Gotchas
 - `contents get`/`search`/`copy`/`move`/`import`/direct links are Premium-only and return `error-notPremium` for standard accounts.
 - `usage lint` must pass after any CLI flag changes; keep `gofile.usage.kdl` in sync.
+- `usage-spec-typer` cannot represent `--public/--private` negations or a `--version` default; `usage_spec()` in `cli.py` patches both into the generated spec, and tests guard them.
 - `uv version <x>` bumps `pyproject.toml` and `uv.lock`; commit both, then tag `v<x>` to publish.

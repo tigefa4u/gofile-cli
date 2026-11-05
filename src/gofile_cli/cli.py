@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any
@@ -17,7 +19,13 @@ from typer_usage import generate
 from . import client
 
 BIN_NAME = "gofile-cli"
-_RICH_MARKUP = __import__("re").compile(r"\[(?:/?[a-z][a-z ]*|/?)\]")
+
+try:
+    __version__ = importlib.metadata.version("gofile-cli")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover - not installed
+    __version__ = "0.0.0"
+
+_RICH_MARKUP = re.compile(r"\[(?:/?[a-z][a-z ]*|/?)\]")
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -174,9 +182,25 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
 # ---------------- callback ----------------
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"{BIN_NAME} {__version__}")
+        raise typer.Exit()
+
+
 @app.callback()
 def _callback(
     ctx: typer.Context,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            callback=_version_callback,
+            is_eager=True,
+            help="Print the version and exit.",
+        ),
+    ] = False,
     token: Annotated[
         str | None,
         typer.Option(
@@ -760,7 +784,27 @@ def ls_alias(
 
 
 def usage_spec() -> str:
-    return _RICH_MARKUP.sub("", generate(app, BIN_NAME))
+    spec = _RICH_MARKUP.sub("", generate(app, BIN_NAME))
+    # Patch known typer_usage gaps here so the committed spec stays exactly
+    # reproducible via `uv run gofile-cli --usage-spec` (CI diffs this output):
+    # 1. It emits the boolean default of the --version option as the spec
+    #    version (e.g. `version False`); replace it with the real version.
+    spec = re.sub(r'(?m)^version .+$', f'version "{__version__}"', spec, count=1)
+    if not re.search(r'(?m)^version "', spec):
+        spec = re.sub(
+            r'(?m)^(bin \S+)$', rf'\g<1>\nversion "{__version__}"', spec, count=1
+        )
+    # 2. It only detects negations shaped like "--no-...", so Typer's
+    #    --public/--private pairs lose their negative form; add it explicitly.
+    spec = spec.replace(
+        'flag --public help="Shareable by link."',
+        'flag --public negate=--private help="Shareable by link."',
+    )
+    spec = spec.replace(
+        'flag --public help="Shareable by link. Omit to inherit parent."',
+        'flag --public negate=--private help="Shareable by link. Omit to inherit parent."',
+    )
+    return spec
 
 
 KNOWN_COMMANDS = {
