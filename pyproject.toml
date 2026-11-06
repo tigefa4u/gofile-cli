@@ -1,6 +1,6 @@
 [project]
 name = "gofile-cli"
-version = "1.0.3"
+version = "1.0.4"
 description = "A command-line client for the Gofile API: upload files and folders, and manage files, folders, accounts and direct links."
 readme = "README.md"
 license = "MIT"
