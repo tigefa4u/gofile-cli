@@ -99,7 +99,7 @@ cmd contents subcommand_required=#true help="Manage files and folders." {
         flag --mod-time help="Modification time Unix timestamp." {
             arg <MOD_TIME>
         }
-        flag --delete-after-expiry help="Premium: permanently delete on expiry."
+        flag --delete-after-expiry help="Premium: permanently delete on expiry. Requires --expiry."
         arg <content_id> help="Content UUID (share codes not accepted)."
     }
     cmd delete help="Delete files and/or folders (recursive for folders)." {
@@ -160,7 +160,7 @@ cmd directlinks subcommand_required=#true help="Manage direct links (Premium)." 
         }
         arg <content_id> help="Content UUID."
     }
-    cmd update help="Update a direct link (Premium, PATCH semantics)." {
+    cmd update help="Update a direct link (Premium, full PUT; only set fields are sent)." {
         flag --expire help="New expiry Unix timestamp; 4102444800 = never." {
             arg <EXPIRE>
         }

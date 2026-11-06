@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import mimetypes
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,12 +19,17 @@ class GofileError(Exception):
     """Raised when the Gofile API returns an error or the request fails."""
 
     def __init__(
-        self, status: str, message: str | None = None, http: int | None = None
-    ):
+        self,
+        status: str,
+        message: str | None = None,
+        http: int | None = None,
+    ) -> None:
         self.status = status
         self.message = message or status
         self.http = http
-        super().__init__(f"{status}: {self.message}")
+        # Avoid "status: status" when the API gave no separate message.
+        detail = f"{status}: {message}" if message else status
+        super().__init__(detail)
 
 
 def _parse_response(resp) -> tuple[Any, Any]:
@@ -85,7 +89,7 @@ def _request(
                 err_payload.get("message"),
                 exc.code,
             ) from exc
-        except json.JSONDecodeError, ValueError:
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             raise GofileError("error-http", str(exc), exc.code) from exc
     except urllib.error.URLError as exc:
         raise GofileError("error-network", str(exc.reason)) from exc
@@ -371,6 +375,17 @@ def delete_direct_link(
 # ---------------- upload ----------------
 
 
+def _escape_header_value(value: str) -> str:
+    """Make a value safe to embed in a quoted multipart header.
+
+    Strips CR/LF (header injection) and escapes embedded quotes/backslashes.
+    Non-ASCII is passed through unchanged; the bytes are encoded as UTF-8 by
+    the caller, matching how urllib encodes the request body.
+    """
+    cleaned = value.replace("\r", "").replace("\n", "")
+    return cleaned.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def upload_file(
     path: str | Path,
     *,
@@ -385,11 +400,11 @@ def upload_file(
     parts: list[bytes] = []
     if folder_id:
         parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="folderId"\r\n\r\n{folder_id}\r\n'.encode()
+            f'--{boundary}\r\nContent-Disposition: form-data; name="folderId"\r\n\r\n{_escape_header_value(folder_id)}\r\n'.encode()
         )
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{_escape_header_value(path.name)}"\r\n'
         f"Content-Type: {mime}\r\n\r\n".encode()
     )
     parts.append(path.read_bytes())
@@ -414,7 +429,7 @@ def upload_file(
                 err_payload.get("message"),
                 exc.code,
             ) from exc
-        except json.JSONDecodeError, ValueError:
+        except ValueError:  # JSONDecodeError is a ValueError subclass
             raise GofileError("error-http", str(exc), exc.code) from exc
     except urllib.error.URLError as exc:
         raise GofileError("error-network", str(exc.reason)) from exc
