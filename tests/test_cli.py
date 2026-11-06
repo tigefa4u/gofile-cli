@@ -63,8 +63,8 @@ class DotenvTokenTests(unittest.TestCase):
 
     def test_export_prefix_is_not_part_of_the_token(self) -> None:
         self.assertEqual(
-            self._read("export GOFILE_API_TOKEN=0IByaHuNma0BjFTQnOT6KQnnYiLm3frr\n"),
-            "0IByaHuNma0BjFTQnOT6KQnnYiLm3frr",
+            self._read("export GOFILE_API_TOKEN=test-token-value\n"),
+            "test-token-value",
         )
 
     def test_inline_comment_is_not_part_of_the_token(self) -> None:
