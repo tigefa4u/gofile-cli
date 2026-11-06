@@ -12,7 +12,13 @@ from typing import Annotated, Any
 
 import typer
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from typer_usage import generate
 
@@ -47,6 +53,12 @@ DOTENV_KEYS = ("GOFILE_API_TOKEN", "GOFILE_TOKEN", "GOFILER_API_TOKEN")
 
 
 def _dotenv_token() -> str | None:
+    """Read a token from the first .env that defines one.
+
+    Precedence is: cwd, $HOME/.config/gofile/.env, $HOME/.gofile/.env.
+    Writing `export GOFILE_API_TOKEN=...` also works, and trailing `# ...`
+    comments on an unquoted value are ignored.
+    """
     candidates = (
         Path.cwd() / ".env",
         Path.home() / ".config" / "gofile" / ".env",
@@ -57,14 +69,30 @@ def _dotenv_token() -> str | None:
             text = dotenv.read_text(encoding="utf-8")
         except OSError:
             continue
-        for line in text.splitlines():
-            line = line.strip()
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            if key.strip() not in DOTENV_KEYS:
+            key = key.strip()
+            if key not in DOTENV_KEYS:
                 continue
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if not value:
+                continue
+            # Strip one layer of matching outer quotes; never reach inside.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            # An unterminated quote is left as-is: the value is malformed and
+            # the API will reject the token, which is the honest failure.
+            # Unquoted values may carry a trailing ` # ...` comment.
+            if value[0] not in "\"'":
+                for marker in (" #", "\t#"):
+                    index = value.find(marker)
+                    if index != -1:
+                        value = value[:index].rstrip()
             if value:
                 return value
     return None
@@ -117,6 +145,24 @@ def _collect_files(path: Path, recursive: bool) -> list[Path]:
     raise client.GofileError("error-file", f"not a file or folder: {path}")
 
 
+def _print_uploads(
+    console: Console, results: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    table = Table(title="Uploaded files")
+    table.add_column("File", style="cyan")
+    table.add_column("Size", justify="right")
+    table.add_column("Download page", style="green")
+    table.add_column("Parent folder", style="dim")
+    for f, data in results:
+        table.add_row(
+            f.name,
+            str(data.get("size", "")),
+            str(data.get("downloadPage", "")),
+            str(data.get("parentFolder", "")),
+        )
+    console.print(table)
+
+
 def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None:
     token = _require_token(ctx)
     files: list[Path] = []
@@ -156,6 +202,15 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
                     f, token=token, folder_id=current_folder, timeout=timeout
                 )
             except client.GofileError as exc:
+                # Report what did land before failing on the file that broke:
+                # without this, a mid-run drop silently loses uploads the
+                # user may not be able to find again.
+                if results:
+                    typer.echo(
+                        f"Error: {exc} after {len(results)} of {len(files)} file(s);",
+                        err=True,
+                    )
+                    _print_uploads(console, results)
                 raise _fail(exc)
             if not isinstance(data, dict):
                 data = {"result": data}
@@ -164,19 +219,7 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
                 current_folder = data.get("parentFolder")
             progress.advance(task)
 
-    table = Table(title="Uploaded files")
-    table.add_column("File", style="cyan")
-    table.add_column("Size", justify="right")
-    table.add_column("Download page", style="green")
-    table.add_column("Parent folder", style="dim")
-    for f, data in results:
-        table.add_row(
-            f.name,
-            str(data.get("size", "")),
-            str(data.get("downloadPage", "")),
-            str(data.get("parentFolder", "")),
-        )
-    console.print(table)
+    _print_uploads(console, results)
 
 
 # ---------------- callback ----------------
@@ -450,12 +493,19 @@ def contents_update(
     delete_after_expiry: Annotated[
         bool | None,
         typer.Option(
-            "--delete-after-expiry", help="Premium: permanently delete on expiry."
+            "--delete-after-expiry",
+            help="Premium: permanently delete on expiry. Requires --expiry.",
         ),
     ] = None,
 ):
     """Update one or more attributes of a file or folder (one API call per attribute)."""
     token = _require_token(ctx)
+    if delete_after_expiry is not None and expiry is None:
+        typer.echo(
+            "Warning: --delete-after-expiry is ignored without --expiry; "
+            "the API only pairs it with an expiry value.",
+            err=True,
+        )
     updates: list[tuple[str, Any]] = []
     if name is not None:
         updates.append(("name", name))
@@ -682,7 +732,7 @@ def directlinks_update(
         bool, typer.Option("--clear-auth", help="Remove auth.")
     ] = False,
 ):
-    """Update a direct link (Premium, PATCH semantics)."""
+    """Update a direct link (Premium, full PUT; only set fields are sent)."""
     token = _require_token(ctx)
     kwargs: dict[str, Any] = {}
     if expire_time is not None:
@@ -789,10 +839,10 @@ def usage_spec() -> str:
     # reproducible via `uv run gofile-cli --usage-spec` (CI diffs this output):
     # 1. It emits the boolean default of the --version option as the spec
     #    version (e.g. `version False`); replace it with the real version.
-    spec = re.sub(r'(?m)^version .+$', f'version "{__version__}"', spec, count=1)
+    spec = re.sub(r"(?m)^version .+$", f'version "{__version__}"', spec, count=1)
     if not re.search(r'(?m)^version "', spec):
         spec = re.sub(
-            r'(?m)^(bin \S+)$', rf'\g<1>\nversion "{__version__}"', spec, count=1
+            r"(?m)^(bin \S+)$", rf'\g<1>\nversion "{__version__}"', spec, count=1
         )
     # 2. It only detects negations shaped like "--no-...", so Typer's
     #    --public/--private pairs lose their negative form; add it explicitly.
@@ -807,16 +857,28 @@ def usage_spec() -> str:
     return spec
 
 
-KNOWN_COMMANDS = {
-    "upload",
-    "account",
-    "contents",
-    "directlinks",
-    "whoami",
-    "mkdir",
-    "ls",
-    "rm",
-}
+def _known_commands() -> set[str]:
+    """Top-level command names, derived from the Typer app.
+
+    Derived rather than hardcoded so a new command automatically opts out of
+    the bare-path-is-an-upload inference in main(); a hand-maintained list
+    would silently break new commands that share a name with a local file.
+    """
+    names: set[str] = set()
+    for info in app.registered_commands:
+        # Typer derives the command name from the callback when not explicit;
+        # fall back to the function name, which is what Typer uses.
+        name = getattr(info, "name", None) or getattr(info.callback, "__name__", "")
+        if name:
+            names.add(name)
+    for group in app.registered_groups:
+        name = getattr(group, "name", None)
+        if name:
+            names.add(name)
+    return names
+
+
+KNOWN_COMMANDS = _known_commands()
 
 
 def main() -> None:
