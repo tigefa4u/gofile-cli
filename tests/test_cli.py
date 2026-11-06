@@ -5,10 +5,12 @@ LiveUploadIntegrationTests is the only class that hits the network.
 
 from __future__ import annotations
 
+import http.client
 import os
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -138,8 +140,11 @@ class LiveUploadIntegrationTests(unittest.TestCase):
     """Exercise real uploads; successful remote content is intentionally kept."""
 
     def test_file_and_folder_upload_shortcuts(self) -> None:
-        token = os.environ.get("GOFILE_API_TOKEN")
-        self.assertTrue(token, "GOFILE_API_TOKEN is required for live upload tests")
+        # resolve_token() honors every source the CLI supports (flag/env/.env);
+        # skip rather than fail when none is configured.
+        token = auth.resolve_token()
+        if not token:
+            self.skipTest("no Gofile token configured (set GOFILE_API_TOKEN/GOFILE_TOKEN or a .env)")
 
         executable = shutil.which("gofile-cli")
         self.assertIsNotNone(executable, "gofile-cli executable is required")
@@ -294,6 +299,110 @@ class UploadRegionTests(unittest.TestCase):
         self.assertEqual(request.full_url, "https://upload-eu-par.gofile.io/uploadfile")
         self.assertEqual(data["guestToken"], "guest-secret")
         self.assertEqual(data["parentFolder"], "p")
+
+
+class StreamingUploadTests(unittest.TestCase):
+    """upload_file streams the body; it never reads the whole file at once."""
+
+    class _Resp(_Body):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _upload(self, path, **kwargs):
+        raw = b'{"status":"ok","data":{"id":"1","parentFolder":"p"}}'
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            # Consume the streaming body while the file is still open, the
+            # way http.client.send() would during a real request.
+            captured["body"] = b"".join(request.data)
+            return self._Resp(raw)
+
+        with mock.patch(
+            "gofile_cli.client.urllib.request.urlopen",
+            side_effect=fake_urlopen,
+        ) as urlopen:
+            client.upload_file(path, token="t", **kwargs)
+        request = urlopen.call_args.args[0]
+        request.streamed_body = captured["body"]
+        return request
+
+    def test_body_is_a_generator_and_content_length_matches(self) -> None:
+        payload = b"x" * (3 * client._UPLOAD_CHUNK + 17)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "big.bin"
+            path.write_bytes(payload)
+            request = self._upload(path)
+
+        self.assertIsInstance(request.data, types.GeneratorType)
+
+
+        # Recompute what Content-Length must be: head + size + tail.
+        head = client._multipart_head(
+            boundary=request.get_header("Content-type").split("boundary=")[1],
+            filename="big.bin",
+            content_type="application/octet-stream",
+            folder_id=None,
+        )
+        tail = b"\r\n" + f"--{request.get_header('Content-type').split('boundary=')[1]}--\r\n".encode()
+        self.assertEqual(
+            request.get_header("Content-length"), str(len(head) + len(payload) + len(tail))
+        )
+
+    def test_streamed_body_matches_in_memory_body(self) -> None:
+        payload = b"y" * (client._UPLOAD_CHUNK + 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f.bin"
+            path.write_bytes(payload)
+            request = self._upload(path)
+        boundary = request.get_header("Content-type").split("boundary=")[1]
+        assembled = request.streamed_body
+        expected = client._multipart_body(
+            boundary=boundary,
+            filename="f.bin",
+            content=payload,
+            content_type="application/octet-stream",
+            folder_id=None,
+        )
+        self.assertEqual(assembled, expected)
+
+
+class TransportErrorTests(unittest.TestCase):
+    """Socket-level failures surface as GofileError, not raw tracebacks."""
+
+    def test_timeout_becomes_error_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f.txt"
+            path.write_text("x", encoding="utf-8")
+            with mock.patch(
+                "gofile_cli.client.urllib.request.urlopen",
+                side_effect=TimeoutError("timed out"),
+            ):
+                with self.assertRaises(client.GofileError) as caught:
+                    client.upload_file(path, token="t")
+        self.assertEqual(caught.exception.status, "error-timeout")
+
+    def test_dns_failure_becomes_error_network(self) -> None:
+        with mock.patch(
+            "gofile_cli.client.urllib.request.urlopen",
+            side_effect=OSError("name resolution failed"),
+        ):
+            with self.assertRaises(client.GofileError) as caught:
+                client.get_account_id(token="t")
+        self.assertEqual(caught.exception.status, "error-network")
+
+    def test_http_exception_becomes_gofile_error(self) -> None:
+
+        with mock.patch(
+            "gofile_cli.client.urllib.request.urlopen",
+            side_effect=http.client.RemoteDisconnected("peer closed"),
+        ):
+            with self.assertRaises(client.GofileError) as caught:
+                client.get_account_id(token="t")
+        self.assertIn(caught.exception.status, ("error-network", "error-http"))
 
 
 def _captured(result) -> str:

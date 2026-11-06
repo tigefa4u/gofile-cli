@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import mimetypes
 import urllib.error
@@ -57,8 +58,14 @@ def _parse_response(resp) -> tuple[Any, Any]:
     return payload.get("data"), payload.get("metadata")
 
 
-def _from_transport(exc: urllib.error.HTTPError | urllib.error.URLError) -> GofileError:
-    """Map a urllib failure to GofileError. HTTPError is a URLError subclass."""
+def _from_transport(
+    exc: urllib.error.HTTPError | urllib.error.URLError | OSError | http.client.HTTPException,
+) -> GofileError:
+    """Map a low-level failure to GofileError.
+
+    HTTPError is a URLError subclass; OSError covers DNS and socket errors
+    (TimeoutError included), which urlopen does not wrap in URLError.
+    """
     if isinstance(exc, urllib.error.HTTPError):
         try:
             err_payload = json.loads(exc.read().decode("utf-8", errors="replace"))
@@ -71,7 +78,12 @@ def _from_transport(exc: urllib.error.HTTPError | urllib.error.URLError) -> Gofi
             err_payload.get("message"),
             exc.code,
         )
-    return GofileError("error-network", str(exc.reason))
+    if isinstance(exc, urllib.error.URLError):
+        return GofileError("error-network", str(exc.reason))
+    if isinstance(exc, TimeoutError):
+        return GofileError("error-timeout", str(exc) or "request timed out")
+    return GofileError("error-network", str(exc))
+
 
 
 def _request(
@@ -105,7 +117,12 @@ def _request(
             return _parse_response(resp)
     except urllib.error.HTTPError as exc:
         raise _from_transport(exc) from exc
-    except urllib.error.URLError as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        http.client.HTTPException,
+    ) as exc:
         raise _from_transport(exc) from exc
 
 
@@ -432,14 +449,14 @@ def _escape_header_value(value: str) -> str:
     return cleaned.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _multipart_body(
+def _multipart_head(
     *,
     boundary: str,
     filename: str,
-    content: bytes,
     content_type: str,
     folder_id: str | None,
 ) -> bytes:
+    """Everything before the file bytes: folderId part and the file header."""
     parts: list[bytes] = []
     if folder_id:
         # folderId is body text, not a quoted header parameter: escaping
@@ -459,10 +476,52 @@ def _multipart_body(
         f"Content-Type: {_multipart_text(content_type)}\r\n\r\n"
     )
     parts.append(header.encode())
-    parts.append(content)
-    parts.append(b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts)
+
+
+_UPLOAD_CHUNK = 64 * 1024
+
+
+def _multipart_body(
+    *,
+    boundary: str,
+    filename: str,
+    content: bytes,
+    content_type: str,
+    folder_id: str | None,
+) -> bytes:
+    """Assemble the full body in memory (used by tests and small payloads)."""
+    tail = b"\r\n" + f"--{boundary}--\r\n".encode()
+    return (
+        _multipart_head(
+            boundary=boundary,
+            filename=filename,
+            content_type=content_type,
+            folder_id=folder_id,
+        )
+        + content
+        + tail
+    )
+
+
+def _multipart_stream(
+    fileobj, *, boundary: str, filename: str, content_type: str, folder_id: str | None
+):
+    """Yield the multipart body in chunks; the file is never fully in memory.
+
+    http.client.send() accepts any iterable of bytes-like objects, so a
+    generator works as the request body. Content-Length is set explicitly
+    by the caller from the file size, so no chunked encoding is needed.
+    """
+    yield _multipart_head(
+        boundary=boundary,
+        filename=filename,
+        content_type=content_type,
+        folder_id=folder_id,
+    )
+    while chunk := fileobj.read(_UPLOAD_CHUNK):
+        yield chunk
+    yield b"\r\n" + f"--{boundary}--\r\n".encode()
 
 
 def _with_guest_token(payload: dict[str, Any], data: Any) -> Any:
@@ -486,22 +545,35 @@ def upload_file(
     path = Path(path)
     if not path.is_file():
         raise GofileError("error-file", f"not a file: {path}")
-    # Reject a bad region before reading the file into memory.
+    # Reject a bad region before opening the file.
     host = upload_host(region)
     boundary = "----gofile" + uuid.uuid4().hex
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    body = _multipart_body(
+    size = path.stat().st_size
+    head = _multipart_head(
         boundary=boundary,
         filename=path.name,
-        content=path.read_bytes(),
         content_type=mime,
         folder_id=folder_id,
     )
+    tail = b"\r\n" + f"--{boundary}--\r\n".encode()
+    # Content-Length from the stat size keeps the request off chunked
+    # transfer encoding; the generator below streams the file in chunks.
+    content_length = len(head) + size + len(tail)
 
     url = f"https://{host}/uploadfile"
+    fileobj = path.open("rb")
+    body = _multipart_stream(
+        fileobj,
+        boundary=boundary,
+        filename=path.name,
+        content_type=mime,
+        folder_id=folder_id,
+    )
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     req.add_header("Accept", "application/json")
+    req.add_header("Content-Length", str(content_length))
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
@@ -509,6 +581,13 @@ def upload_file(
             payload = _read_payload(resp)
     except urllib.error.HTTPError as exc:
         raise _from_transport(exc) from exc
-    except urllib.error.URLError as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        http.client.HTTPException,
+    ) as exc:
         raise _from_transport(exc) from exc
+    finally:
+        fileobj.close()
     return _with_guest_token(payload, payload.get("data"))
