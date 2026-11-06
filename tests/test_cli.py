@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,6 +81,17 @@ class DotenvTokenTests(unittest.TestCase):
         # Old code: .strip('"').strip("'") turned `"""tok"""` into `tok`.
         self.assertEqual(self._read('GOFILE_API_TOKEN="""tok"""\n'), '""tok""')
 
+    def test_environment_token_is_used_before_dotenv(self) -> None:
+        with (
+            mock.patch.dict(
+                "gofile_cli.cli.os.environ",
+                {"GOFILE_API_TOKEN": "synthetic-ci-token"},
+                clear=True,
+            ),
+            mock.patch("gofile_cli.cli._dotenv_token", return_value="dotenv-token"),
+        ):
+            self.assertEqual(cli.resolve_token(), "synthetic-ci-token")
+
     def test_precedence_prefers_cwd_over_home(self) -> None:
         # A cwd .env takes priority over the home fallbacks.
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,6 +109,49 @@ class DotenvTokenTests(unittest.TestCase):
                 mock.patch("gofile_cli.cli.Path.cwd", return_value=root / "work"),
             ):
                 self.assertEqual(cli._dotenv_token(), "from-cwd")
+
+
+class LiveUploadIntegrationTests(unittest.TestCase):
+    """Exercise real uploads; successful remote content is intentionally kept."""
+
+    def test_file_and_folder_upload_shortcuts(self) -> None:
+        token = os.environ.get("GOFILE_API_TOKEN")
+        self.assertTrue(token, "GOFILE_API_TOKEN is required for live upload tests")
+
+        executable = shutil.which("gofile-cli")
+        self.assertIsNotNone(executable, "gofile-cli executable is required")
+        env = os.environ.copy()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "file.txt").write_text("live upload integration test\n")
+            folder = root / "folder"
+            folder.mkdir()
+            for name in ("file1.txt", "file2.txt", "file3.txt"):
+                (folder / name).write_text(f"live upload integration test: {name}\n")
+
+            for relative_path, expected_names in (
+                ("file.txt", ("file.txt",)),
+                ("folder/", ("file1.txt", "file2.txt", "file3.txt")),
+            ):
+                with self.subTest(path=relative_path):
+                    result = subprocess.run(
+                        [executable, relative_path],
+                        cwd=root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        f"Upload command failed for {relative_path}:\n"
+                        f"{result.stdout}\n{result.stderr}",
+                    )
+                    for name in expected_names:
+                        self.assertIn(name, result.stdout)
 
 
 class HeaderEscapingTests(unittest.TestCase):
