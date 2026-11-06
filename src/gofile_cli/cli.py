@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -23,6 +22,7 @@ from rich.table import Table
 from typer_usage import generate
 
 from . import client
+from .auth import resolve_token
 
 BIN_NAME = "gofile-cli"
 
@@ -47,68 +47,11 @@ app.add_typer(contents_app, name="contents")
 app.add_typer(directlinks_app, name="directlinks")
 
 
-# ---------------- config / auth ----------------
-
-DOTENV_KEYS = ("GOFILE_API_TOKEN", "GOFILE_TOKEN", "GOFILER_API_TOKEN")
-
-
-def _dotenv_token() -> str | None:
-    """Read a token from the first .env that defines one.
-
-    Precedence is: cwd, $HOME/.config/gofile/.env, $HOME/.gofile/.env.
-    Writing `export GOFILE_API_TOKEN=...` also works, and trailing `# ...`
-    comments on an unquoted value are ignored.
-    """
-    candidates = (
-        Path.cwd() / ".env",
-        Path.home() / ".config" / "gofile" / ".env",
-        Path.home() / ".gofile" / ".env",
-    )
-    for dotenv in candidates:
-        try:
-            text = dotenv.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if line.startswith("export "):
-                line = line[len("export ") :].lstrip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            if key not in DOTENV_KEYS:
-                continue
-            value = value.strip()
-            if not value:
-                continue
-            # Strip one layer of matching outer quotes; never reach inside.
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            # An unterminated quote is left as-is: the value is malformed and
-            # the API will reject the token, which is the honest failure.
-            # Unquoted values may carry a trailing ` # ...` comment.
-            if value[0] not in "\"'":
-                for marker in (" #", "\t#"):
-                    index = value.find(marker)
-                    if index != -1:
-                        value = value[:index].rstrip()
-            if value:
-                return value
-    return None
-
-
-def resolve_token(cli_token: str | None = None) -> str | None:
-    candidates = (
-        cli_token,
-        os.environ.get("GOFILE_API_TOKEN"),
-        os.environ.get("GOFILE_TOKEN"),
-        _dotenv_token(),
-    )
-    for c in candidates:
-        if c:
-            return c
-    return None
+_REGION_HELP = (
+    "Upload region ("
+    + ", ".join(["auto", *client.UPLOAD_REGIONS])
+    + "). Default is the closest region."
+)
 
 
 def _require_token(ctx: typer.Context) -> str:
@@ -163,8 +106,51 @@ def _print_uploads(
     console.print(table)
 
 
-def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None:
-    token = _require_token(ctx)
+def _guest_token_from(data: Any) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    issued = data.get("guestToken")
+    if isinstance(issued, str) and issued:
+        return issued
+    return None
+
+
+def _print_guest_token(guest_token: str | None) -> None:
+    if not guest_token:
+        return
+    typer.echo(
+        "Guest token (save it; this account has no email):\n" + guest_token,
+        err=True,
+    )
+
+
+def _do_upload(
+    ctx: typer.Context,
+    paths,
+    folder_id,
+    recursive,
+    timeout,
+    *,
+    region: str | None,
+    guest: bool,
+) -> None:
+    token = (ctx.obj or {}).get("token")
+    if guest:
+        if token:
+            typer.echo("Error: --guest cannot be combined with a token.", err=True)
+            raise typer.Exit(code=1)
+        token = None
+    elif not token:
+        typer.echo(
+            "Error: no API token. Set --token, $GOFILE_API_TOKEN, or a .env file, "
+            "or pass --guest.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        client.upload_host(region)
+    except client.GofileError as exc:
+        raise _fail(exc)
     files: list[Path] = []
     for raw in paths:
         p = Path(raw)
@@ -185,6 +171,8 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
     current_folder = folder_id
     console = Console()
     results: list[tuple[Path, dict[str, Any]]] = []
+    guest_token: str | None = None
+    missing_guest_token = False
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}[/bold blue]"),
@@ -199,19 +187,38 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
             progress.update(task, description=f"Uploading {f.name}")
             try:
                 data = client.upload_file(
-                    f, token=token, folder_id=current_folder, timeout=timeout
+                    f,
+                    token=token,
+                    folder_id=current_folder,
+                    region=region,
+                    timeout=timeout,
                 )
             except client.GofileError as exc:
                 # Report what did land before failing on the file that broke:
                 # without this, a mid-run drop silently loses uploads the
-                # user may not be able to find again.
+                # user may not be able to find again. The guest token has to
+                # be printed here too, or a mid-batch failure orphans it.
                 if results:
                     typer.echo(
                         f"Error: {exc} after {len(results)} of {len(files)} file(s);",
                         err=True,
                     )
                     _print_uploads(console, results)
+                _print_guest_token(guest_token)
                 raise _fail(exc)
+            if guest and guest_token is None and not missing_guest_token:
+                issued = _guest_token_from(data)
+                if issued:
+                    token = issued
+                    guest_token = issued
+                else:
+                    missing_guest_token = True
+                    if len(files) > 1:
+                        typer.echo(
+                            "Warning: upload response had no guestToken; "
+                            "later files may land in a different guest account.",
+                            err=True,
+                        )
             if not isinstance(data, dict):
                 data = {"result": data}
             results.append((f, data))
@@ -219,6 +226,7 @@ def _do_upload(ctx: typer.Context, paths, folder_id, recursive, timeout) -> None
                 current_folder = data.get("parentFolder")
             progress.advance(task)
 
+    _print_guest_token(guest_token)
     _print_uploads(console, results)
 
 
@@ -278,12 +286,34 @@ def upload(
         bool,
         typer.Option("--recursive", "-r", help="Upload files in subfolders too."),
     ] = False,
+    region: Annotated[
+        str | None,
+        typer.Option("--region", help=_REGION_HELP),
+    ] = None,
+    guest: Annotated[
+        bool,
+        typer.Option(
+            "--guest",
+            help=(
+                "Upload without an account. Prints the new guest token and "
+                "reuses it for every file in the batch. Refuses when a token is set."
+            ),
+        ),
+    ] = False,
     timeout: Annotated[
         float, typer.Option("--timeout", help="Request timeout in seconds.")
     ] = 120.0,
 ):
     """Upload one or more files or folders to Gofile."""
-    _do_upload(ctx, paths, folder_id, recursive, timeout)
+    _do_upload(
+        ctx,
+        paths,
+        folder_id,
+        recursive,
+        timeout,
+        region=region,
+        guest=guest,
+    )
 
 
 # ---------------- account ----------------
@@ -732,7 +762,7 @@ def directlinks_update(
         bool, typer.Option("--clear-auth", help="Remove auth.")
     ] = False,
 ):
-    """Update a direct link (Premium, full PUT; only set fields are sent)."""
+    """Update a direct link (Premium). Omitted fields keep their current value."""
     token = _require_token(ctx)
     kwargs: dict[str, Any] = {}
     if expire_time is not None:
@@ -790,44 +820,10 @@ def whoami(ctx: typer.Context):
     ctx.invoke(account_show, ctx=ctx, account_id=None)
 
 
-@app.command("mkdir")
-def mkdir_alias(
-    ctx: typer.Context,
-    parent_folder_id: Annotated[str, typer.Argument(help="Parent folder UUID.")],
-    name: Annotated[
-        str | None, typer.Option("--name", "-n", help="Folder display name.")
-    ] = None,
-    public: Annotated[
-        bool | None, typer.Option("--public/--private", help="Shareable by link.")
-    ] = None,
-):
-    """Alias for 'contents create-folder'."""
-    ctx.invoke(
-        contents_create_folder,
-        ctx=ctx,
-        parent_folder_id=parent_folder_id,
-        name=name,
-        public=public,
-    )
-
-
-@app.command("rm")
-def rm_alias(
-    ctx: typer.Context,
-    contents_ids: Annotated[list[str], typer.Argument(help="Content UUIDs to delete.")],
-    yes: Annotated[bool, typer.Option("--yes", "-y", help="Confirm deletion.")] = False,
-):
-    """Alias for 'contents delete'."""
-    ctx.invoke(contents_delete, ctx=ctx, contents_ids=contents_ids, yes=yes)
-
-
-@app.command("ls")
-def ls_alias(
-    ctx: typer.Context,
-    content_id: Annotated[str, typer.Argument(help="Folder/file UUID or share code.")],
-):
-    """Alias for 'contents get'."""
-    ctx.invoke(contents_get, ctx=ctx, content_id=content_id)
+# Same callbacks as the contents commands, so an alias cannot drop a flag.
+app.command("mkdir", help="Alias for 'contents create-folder'.")(contents_create_folder)
+app.command("rm", help="Alias for 'contents delete'.")(contents_delete)
+app.command("ls", help="Alias for 'contents get'.")(contents_get)
 
 
 # ---------------- usage spec ----------------
@@ -846,10 +842,7 @@ def usage_spec() -> str:
         )
     # 2. It only detects negations shaped like "--no-...", so Typer's
     #    --public/--private pairs lose their negative form; add it explicitly.
-    spec = spec.replace(
-        'flag --public help="Shareable by link."',
-        'flag --public negate=--private help="Shareable by link."',
-    )
+    #    mkdir and contents create-folder share one callback, so one string.
     spec = spec.replace(
         'flag --public help="Shareable by link. Omit to inherit parent."',
         'flag --public negate=--private help="Shareable by link. Omit to inherit parent."',

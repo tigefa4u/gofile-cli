@@ -1,18 +1,22 @@
-"""Offline tests for gofile-cli. No tests hit the network."""
+"""Tests for gofile-cli.
+
+LiveUploadIntegrationTests is the only class that hits the network.
+"""
 
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from typer.testing import CliRunner
+
 import gofile_cli
-from gofile_cli import cli, client
+from gofile_cli import auth, cli, client
 from gofile_cli.cli import usage_spec
 
 
@@ -29,7 +33,7 @@ class UsageSpecTests(unittest.TestCase):
 
     def test_usage_spec_documents_private_negations(self) -> None:
         # typer_usage cannot express --public/--private; usage_spec() patches
-        # negate=--private onto both flags (mkdir and contents create-folder).
+        # negate=--private onto both commands (mkdir and contents create-folder).
         spec = usage_spec()
         self.assertEqual(spec.count("negate=--private"), 2)
 
@@ -50,6 +54,10 @@ class GofileErrorTests(unittest.TestCase):
         exc = client.GofileError("error-http", "boom", 500)
         self.assertEqual(str(exc), "error-http: boom")
 
+    def test_message_equal_to_status_is_not_repeated(self) -> None:
+        exc = client.GofileError("error-notPremium", "error-notPremium")
+        self.assertEqual(str(exc), "error-notPremium")
+
 
 class DotenvTokenTests(unittest.TestCase):
     """_dotenv_token() mis-parses export lines, inline comments, and quotes."""
@@ -60,10 +68,10 @@ class DotenvTokenTests(unittest.TestCase):
             path = Path(tmp) / ".env"
             path.write_text(text, encoding="utf-8")
             with (
-                mock.patch("gofile_cli.cli.Path.cwd", return_value=Path(tmp)),
-                mock.patch("gofile_cli.cli.Path.home", return_value=Path(tmp)),
+                mock.patch("gofile_cli.auth.Path.cwd", return_value=Path(tmp)),
+                mock.patch("gofile_cli.auth.Path.home", return_value=Path(tmp)),
             ):
-                return cli._dotenv_token()
+                return auth._dotenv_token()
 
     def test_export_prefix_is_not_part_of_the_token(self) -> None:
         self.assertEqual(
@@ -84,13 +92,28 @@ class DotenvTokenTests(unittest.TestCase):
     def test_environment_token_is_used_before_dotenv(self) -> None:
         with (
             mock.patch.dict(
-                "gofile_cli.cli.os.environ",
+                "gofile_cli.auth.os.environ",
                 {"GOFILE_API_TOKEN": "synthetic-ci-token"},
                 clear=True,
             ),
-            mock.patch("gofile_cli.cli._dotenv_token", return_value="dotenv-token"),
+            mock.patch("gofile_cli.auth._dotenv_token", return_value="dotenv-token"),
         ):
-            self.assertEqual(cli.resolve_token(), "synthetic-ci-token")
+            self.assertEqual(auth.resolve_token(), "synthetic-ci-token")
+
+    def test_empty_quotes_do_not_crash_and_are_skipped(self) -> None:
+        self.assertIsNone(self._read('GOFILE_API_TOKEN=""\n'))
+        self.assertEqual(
+            self._read('GOFILE_API_TOKEN=""\nGOFILE_TOKEN=second\n'),
+            "second",
+        )
+
+    def test_comment_after_closing_quote_is_dropped(self) -> None:
+        self.assertEqual(self._read('GOFILE_API_TOKEN="tok" # note\n'), "tok")
+        self.assertEqual(self._read("GOFILE_API_TOKEN='tok' # note\n"), "tok")
+        self.assertEqual(self._read('GOFILE_API_TOKEN="tok" # "no"\n'), "tok")
+
+    def test_hash_inside_quotes_is_kept(self) -> None:
+        self.assertEqual(self._read('GOFILE_API_TOKEN="abc # keep"\n'), "abc # keep")
 
     def test_precedence_prefers_cwd_over_home(self) -> None:
         # A cwd .env takes priority over the home fallbacks.
@@ -105,10 +128,10 @@ class DotenvTokenTests(unittest.TestCase):
                 "GOFILE_API_TOKEN=from-cwd\n", encoding="utf-8"
             )
             with (
-                mock.patch("gofile_cli.cli.Path.home", return_value=root / "home"),
-                mock.patch("gofile_cli.cli.Path.cwd", return_value=root / "work"),
+                mock.patch("gofile_cli.auth.Path.home", return_value=root / "home"),
+                mock.patch("gofile_cli.auth.Path.cwd", return_value=root / "work"),
             ):
-                self.assertEqual(cli._dotenv_token(), "from-cwd")
+                self.assertEqual(auth._dotenv_token(), "from-cwd")
 
 
 class LiveUploadIntegrationTests(unittest.TestCase):
@@ -181,6 +204,233 @@ class KnownCommandsTests(unittest.TestCase):
     def test_bare_path_that_shadows_a_command_is_not_an_upload(self) -> None:
         # A file named like a command must not be rewritten to `upload`.
         self.assertIn("upload", cli.KNOWN_COMMANDS)
+
+
+class _Body:
+    def __init__(self, raw: bytes, status: int = 200) -> None:
+        self._raw = raw
+        self.status = status
+
+    def read(self) -> bytes:
+        return self._raw
+
+
+class ParseResponseTests(unittest.TestCase):
+    def test_status_without_message_is_not_duplicated(self) -> None:
+        with self.assertRaises(client.GofileError) as caught:
+            client._read_payload(_Body(b'{"status":"error-notPremium"}'))
+        self.assertEqual(str(caught.exception), "error-notPremium")
+
+    def test_distinct_message_keeps_the_prefix(self) -> None:
+        with self.assertRaises(client.GofileError) as caught:
+            client._read_payload(
+                _Body(b'{"status":"error-field","message":"bad tags"}')
+            )
+        self.assertEqual(str(caught.exception), "error-field: bad tags")
+
+
+class MultipartBodyTests(unittest.TestCase):
+    def test_folder_id_is_body_text_and_filename_is_a_header(self) -> None:
+        body = client._multipart_body(
+            boundary="BOUND",
+            filename='a"b.txt',
+            content=b"hi",
+            content_type="text/plain",
+            folder_id='id"still',
+        )
+        self.assertIn(b'name="folderId"\r\n\r\nid"still\r\n', body)
+        self.assertNotIn(b'id\\"still', body)
+        self.assertIn(b'filename="a\\"b.txt"', body)
+
+    def test_folder_id_cannot_inject_a_part(self) -> None:
+        body = client._multipart_body(
+            boundary="BOUND",
+            filename="file.txt",
+            content=b"hi",
+            content_type="text/plain",
+            folder_id="ab\r\n--BOUND",
+        )
+        self.assertNotIn(b"ab\r\n--BOUND", body)
+        self.assertIn(b"ab--BOUND\r\n", body)
+
+
+class UploadRegionTests(unittest.TestCase):
+    def test_known_region_is_an_allowlisted_host(self) -> None:
+        self.assertEqual(client.upload_host("EU-PAR"), "upload-eu-par.gofile.io")
+        self.assertEqual(client.upload_host(None), "upload.gofile.io")
+        self.assertEqual(client.upload_host("auto"), "upload.gofile.io")
+
+    def test_unknown_region_is_rejected_before_the_network(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with mock.patch("gofile_cli.client.urllib.request.urlopen") as urlopen:
+                with self.assertRaises(client.GofileError) as caught:
+                    client.upload_file(path, region="https://evil.example")
+                urlopen.assert_not_called()
+        self.assertEqual(caught.exception.status, "error-region")
+
+    def test_region_selects_the_host_and_keeps_a_top_level_guest_token(self) -> None:
+        class _Resp(_Body):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        raw = (
+            b'{"status":"ok","data":{"id":"1","parentFolder":"p"},'
+            b'"guestToken":"guest-secret"}'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with mock.patch(
+                "gofile_cli.client.urllib.request.urlopen",
+                return_value=_Resp(raw),
+            ) as urlopen:
+                data = client.upload_file(path, region="eu-par", token="t")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://upload-eu-par.gofile.io/uploadfile")
+        self.assertEqual(data["guestToken"], "guest-secret")
+        self.assertEqual(data["parentFolder"], "p")
+
+
+def _captured(result) -> str:
+    return (result.output or "") + (getattr(result, "stderr", None) or "")
+
+
+class UploadCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runner = CliRunner()
+
+    def test_ls_accepts_the_same_options_as_contents_get(self) -> None:
+        listing = self.runner.invoke(cli.app, ["ls", "--help"])
+        reading = self.runner.invoke(cli.app, ["contents", "get", "--help"])
+        self.assertEqual(listing.exit_code, 0)
+        self.assertEqual(reading.exit_code, 0)
+        for flag in ("--password", "--page", "--page-size", "--maxdepth", "--filter"):
+            self.assertIn(flag, listing.output)
+            self.assertIn(flag, reading.output)
+
+    def test_missing_token_still_refuses_without_guest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with (
+                mock.patch.dict("gofile_cli.auth.os.environ", {}, clear=True),
+                mock.patch("gofile_cli.auth._dotenv_token", return_value=None),
+                mock.patch("gofile_cli.client.upload_file") as upload,
+            ):
+                result = self.runner.invoke(cli.app, ["upload", str(path)])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("no API token", _captured(result))
+        upload.assert_not_called()
+
+    def test_guest_flag_refuses_when_a_token_is_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    "gofile_cli.auth.os.environ",
+                    {"GOFILE_API_TOKEN": "real-token"},
+                    clear=True,
+                ),
+                mock.patch("gofile_cli.client.upload_file") as upload,
+            ):
+                result = self.runner.invoke(cli.app, ["upload", str(path), "--guest"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("cannot be combined", _captured(result))
+        upload.assert_not_called()
+
+    def test_guest_upload_reuses_the_issued_token(self) -> None:
+        calls: list[dict] = []
+
+        def upload(path, *, token, folder_id, region, timeout):
+            name = Path(path).name
+            calls.append(
+                {"name": name, "token": token, "folder_id": folder_id, "region": region}
+            )
+            if name == "b.txt":
+                raise client.GofileError("error-limits", "cap")
+            return {
+                "name": name,
+                "size": 1,
+                "downloadPage": "https://gofile.io/d/abc",
+                "parentFolder": "folder-1",
+                "guestToken": "guest-secret",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            (root / "b.txt").write_text("b", encoding="utf-8")
+            with (
+                mock.patch.dict("gofile_cli.auth.os.environ", {}, clear=True),
+                mock.patch("gofile_cli.auth._dotenv_token", return_value=None),
+                mock.patch("gofile_cli.client.upload_file", upload),
+            ):
+                result = self.runner.invoke(
+                    cli.app,
+                    ["upload", str(root / "a.txt"), str(root / "b.txt"), "--guest"],
+                )
+        text = _captured(result)
+        self.assertEqual(result.exit_code, 1, text)
+        self.assertEqual(calls[0]["token"], None)
+        self.assertEqual(calls[1]["token"], "guest-secret")
+        self.assertEqual(calls[1]["folder_id"], "folder-1")
+        self.assertIn("guest-secret", text)
+        self.assertIn("a.txt", text)
+
+    def test_a_real_token_is_not_replaced_by_guest_token(self) -> None:
+        seen: list[str | None] = []
+
+        def upload(path, *, token, folder_id, region, timeout):
+            seen.append(token)
+            return {
+                "name": Path(path).name,
+                "size": 1,
+                "downloadPage": "https://gofile.io/d/abc",
+                "parentFolder": "folder-1",
+                "guestToken": "should-not-print",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    "gofile_cli.auth.os.environ",
+                    {"GOFILE_API_TOKEN": "real-token"},
+                    clear=True,
+                ),
+                mock.patch("gofile_cli.auth._dotenv_token", return_value=None),
+                mock.patch("gofile_cli.client.upload_file", upload),
+            ):
+                result = self.runner.invoke(cli.app, ["upload", str(path)])
+        self.assertEqual(result.exit_code, 0, _captured(result))
+        self.assertEqual(seen, ["real-token"])
+        self.assertNotIn("should-not-print", _captured(result))
+
+    def test_unknown_region_fails_before_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("x", encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    "gofile_cli.auth.os.environ",
+                    {"GOFILE_API_TOKEN": "real-token"},
+                    clear=True,
+                ),
+                mock.patch("gofile_cli.client.upload_file") as upload,
+            ):
+                result = self.runner.invoke(
+                    cli.app, ["upload", str(path), "--region", "https://evil.example"]
+                )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("unknown upload region", _captured(result))
+        upload.assert_not_called()
 
 
 if __name__ == "__main__":

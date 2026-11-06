@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 API_BASE = "https://api.gofile.io"
-UPLOAD_BASE = "https://upload.gofile.io"
+UPLOAD_HOST = "upload.gofile.io"
 
 
 class GofileError(Exception):
@@ -27,29 +27,51 @@ class GofileError(Exception):
         self.status = status
         self.message = message or status
         self.http = http
-        # Avoid "status: status" when the API gave no separate message.
-        detail = f"{status}: {message}" if message else status
+        # The API often has no message, or repeats the status as the message.
+        # Printing both yields "error-notPremium: error-notPremium".
+        detail = status if not message or message == status else f"{status}: {message}"
         super().__init__(detail)
 
 
-def _parse_response(resp) -> tuple[Any, Any]:
+def _read_payload(resp) -> dict[str, Any]:
     raw = resp.read()
+    http = getattr(resp, "status", None)
     try:
         payload = json.loads(raw.decode("utf-8", errors="replace"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise GofileError(
             "error-parse",
             raw.decode("utf-8", errors="replace"),
-            getattr(resp, "status", None),
+            http,
         ) from exc
+    if not isinstance(payload, dict):
+        raise GofileError("error-parse", "response was not a JSON object", http)
     status = payload.get("status")
     if status != "ok":
-        raise GofileError(
-            status or "error",
-            payload.get("message") or status,
-            getattr(resp, "status", None),
-        )
+        raise GofileError(status or "error", payload.get("message"), http)
+    return payload
+
+
+def _parse_response(resp) -> tuple[Any, Any]:
+    payload = _read_payload(resp)
     return payload.get("data"), payload.get("metadata")
+
+
+def _from_transport(exc: urllib.error.HTTPError | urllib.error.URLError) -> GofileError:
+    """Map a urllib failure to GofileError. HTTPError is a URLError subclass."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            err_payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+        except ValueError:
+            return GofileError("error-http", str(exc), exc.code)
+        if not isinstance(err_payload, dict):
+            return GofileError("error-http", str(exc), exc.code)
+        return GofileError(
+            err_payload.get("status") or "error-http",
+            err_payload.get("message"),
+            exc.code,
+        )
+    return GofileError("error-network", str(exc.reason))
 
 
 def _request(
@@ -82,17 +104,9 @@ def _request(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return _parse_response(resp)
     except urllib.error.HTTPError as exc:
-        try:
-            err_payload = json.loads(exc.read().decode("utf-8", errors="replace"))
-            raise GofileError(
-                err_payload.get("status") or "error-http",
-                err_payload.get("message"),
-                exc.code,
-            ) from exc
-        except ValueError:  # JSONDecodeError is a ValueError subclass
-            raise GofileError("error-http", str(exc), exc.code) from exc
+        raise _from_transport(exc) from exc
     except urllib.error.URLError as exc:
-        raise GofileError("error-network", str(exc.reason)) from exc
+        raise _from_transport(exc) from exc
 
 
 # ---------------- accounts ----------------
@@ -374,6 +388,38 @@ def delete_direct_link(
 
 # ---------------- upload ----------------
 
+# Region id → hostname. The id is looked up, never concatenated into a URL,
+# so a crafted value cannot redirect the token to another host.
+UPLOAD_REGIONS: dict[str, str] = {
+    "eu-par": "upload-eu-par.gofile.io",
+    "na-phx": "upload-na-phx.gofile.io",
+    "na-nyc": "upload-na-nyc.gofile.io",
+    "ap-sgp": "upload-ap-sgp.gofile.io",
+    "ap-hkg": "upload-ap-hkg.gofile.io",
+    "ap-tyo": "upload-ap-tyo.gofile.io",
+    "ap-syd": "upload-ap-syd.gofile.io",
+    "sa-sao": "upload-sa-sao.gofile.io",
+}
+
+
+def upload_host(region: str | None = None) -> str:
+    """Map a region id to an upload hostname. None and 'auto' use the global host."""
+    if region is None or region.lower() == "auto":
+        return UPLOAD_HOST
+    host = UPLOAD_REGIONS.get(region.lower())
+    if host is None:
+        known = ", ".join(["auto", *UPLOAD_REGIONS])
+        raise GofileError(
+            "error-region",
+            f"unknown upload region {region!r} (choose {known})",
+        )
+    return host
+
+
+def _multipart_text(value: str) -> str:
+    """Drop CR/LF so a field cannot break out of its multipart part."""
+    return value.replace("\r", "").replace("\n", "")
+
 
 def _escape_header_value(value: str) -> str:
     """Make a value safe to embed in a quoted multipart header.
@@ -382,8 +428,51 @@ def _escape_header_value(value: str) -> str:
     Non-ASCII is passed through unchanged; the bytes are encoded as UTF-8 by
     the caller, matching how urllib encodes the request body.
     """
-    cleaned = value.replace("\r", "").replace("\n", "")
+    cleaned = _multipart_text(value)
     return cleaned.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _multipart_body(
+    *,
+    boundary: str,
+    filename: str,
+    content: bytes,
+    content_type: str,
+    folder_id: str | None,
+) -> bytes:
+    parts: list[bytes] = []
+    if folder_id:
+        # folderId is body text, not a quoted header parameter: escaping
+        # quotes here would corrupt the id. CR/LF stripping is enough.
+        field = _multipart_text(folder_id)
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="folderId"\r\n\r\n'
+                f"{field}\r\n"
+            ).encode()
+        )
+    header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; '
+        f'filename="{_escape_header_value(filename)}"\r\n'
+        f"Content-Type: {_multipart_text(content_type)}\r\n\r\n"
+    )
+    parts.append(header.encode())
+    parts.append(content)
+    parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts)
+
+
+def _with_guest_token(payload: dict[str, Any], data: Any) -> Any:
+    """Keep a top-level guestToken on the data object the CLI already reads."""
+    if not isinstance(data, dict) or data.get("guestToken"):
+        return data
+    guest = payload.get("guestToken")
+    if isinstance(guest, str) and guest:
+        return {**data, "guestToken": guest}
+    return data
 
 
 def upload_file(
@@ -391,28 +480,25 @@ def upload_file(
     *,
     token: str | None = None,
     folder_id: str | None = None,
+    region: str | None = None,
     timeout: float = 120.0,
 ) -> Any:
     path = Path(path)
     if not path.is_file():
         raise GofileError("error-file", f"not a file: {path}")
+    # Reject a bad region before reading the file into memory.
+    host = upload_host(region)
     boundary = "----gofile" + uuid.uuid4().hex
-    parts: list[bytes] = []
-    if folder_id:
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="folderId"\r\n\r\n{_escape_header_value(folder_id)}\r\n'.encode()
-        )
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{_escape_header_value(path.name)}"\r\n'
-        f"Content-Type: {mime}\r\n\r\n".encode()
+    body = _multipart_body(
+        boundary=boundary,
+        filename=path.name,
+        content=path.read_bytes(),
+        content_type=mime,
+        folder_id=folder_id,
     )
-    parts.append(path.read_bytes())
-    parts.append(b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
 
-    url = UPLOAD_BASE + "/uploadfile"
+    url = f"https://{host}/uploadfile"
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     req.add_header("Accept", "application/json")
@@ -420,16 +506,9 @@ def upload_file(
         req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _parse_response(resp)[0]
+            payload = _read_payload(resp)
     except urllib.error.HTTPError as exc:
-        try:
-            err_payload = json.loads(exc.read().decode("utf-8", errors="replace"))
-            raise GofileError(
-                err_payload.get("status") or "error-http",
-                err_payload.get("message"),
-                exc.code,
-            ) from exc
-        except ValueError:  # JSONDecodeError is a ValueError subclass
-            raise GofileError("error-http", str(exc), exc.code) from exc
+        raise _from_transport(exc) from exc
     except urllib.error.URLError as exc:
-        raise GofileError("error-network", str(exc.reason)) from exc
+        raise _from_transport(exc) from exc
+    return _with_guest_token(payload, payload.get("data"))

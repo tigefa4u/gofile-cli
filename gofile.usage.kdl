@@ -12,6 +12,10 @@ cmd upload help="Upload one or more files or folders to Gofile." {
         arg <FOLDER_ID>
     }
     flag "-r --recursive" help="Upload files in subfolders too."
+    flag --region help="Upload region (auto, eu-par, na-phx, na-nyc, ap-sgp, ap-hkg, ap-tyo, ap-syd, sa-sao). Default is the closest region." {
+        arg <REGION>
+    }
+    flag --guest help="Upload without an account. Prints the new guest token and reuses it for every file in the batch. Refuses when a token is set."
     flag --timeout help="Request timeout in seconds." default="120.0" {
         arg <TIMEOUT>
     }
@@ -19,17 +23,38 @@ cmd upload help="Upload one or more files or folders to Gofile." {
 }
 cmd whoami help="Print the current account's full details."
 cmd mkdir help="Alias for 'contents create-folder'." {
-    flag "-n --name" help="Folder display name." {
+    flag "-n --name" help="Folder display name. Omit to auto-generate." {
         arg <NAME>
     }
-    flag --public negate=--private help="Shareable by link."
-    arg <parent_folder_id> help="Parent folder UUID."
+    flag --public negate=--private help="Shareable by link. Omit to inherit parent."
+    arg <parent_folder_id> help="Parent folder UUID (root folder UUID for top-level)."
 }
 cmd rm help="Alias for 'contents delete'." {
     flag "-y --yes" help="Confirm deletion."
     arg <contents_ids>… help="Content UUIDs to delete." var=#true
 }
 cmd ls help="Alias for 'contents get'." {
+    flag --password help="SHA-256 hash of folder password." {
+        arg <PASSWORD>
+    }
+    flag --page help="Page number (1-based)." {
+        arg <PAGE>
+    }
+    flag --page-size help="Items per page." {
+        arg <PAGE_SIZE>
+    }
+    flag --sort-field help=createTime|name|size|downloads|mimetype. {
+        arg <SORT_FIELD>
+    }
+    flag --sort-direction help="1 ascending, -1 descending." {
+        arg <SORT_DIRECTION>
+    }
+    flag --filter help="Case-insensitive substring filter on child names/tags." {
+        arg <FILTER>
+    }
+    flag --maxdepth help="Nested children depth 1-16 (default 1)." {
+        arg <MAXDEPTH>
+    }
     arg <content_id> help="Folder/file UUID or share code."
 }
 cmd account subcommand_required=#true help="Manage Gofile accounts." {
@@ -160,7 +185,7 @@ cmd directlinks subcommand_required=#true help="Manage direct links (Premium)." 
         }
         arg <content_id> help="Content UUID."
     }
-    cmd update help="Update a direct link (Premium, full PUT; only set fields are sent)." {
+    cmd update help="Update a direct link (Premium). Omitted fields keep their current value." {
         flag --expire help="New expiry Unix timestamp; 4102444800 = never." {
             arg <EXPIRE>
         }
